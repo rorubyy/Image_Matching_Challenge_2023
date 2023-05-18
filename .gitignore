@@ -1,4 +1,4 @@
-model/
-kornia-loft/
-super-glue-pretrained-network/
-kaggle/
+model/*
+kornia-loft/*
+super-glue-pretrained-network/*
+kaggle/*
