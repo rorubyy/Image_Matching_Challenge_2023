@@ -41,6 +41,8 @@ def load_torch_image(fname, device=torch.device('cpu')):
     return img
 
 # We will use ViT global descriptor to get matching shortlists.
+
+
 def get_global_desc(fnames, model,
                     device=torch.device('cpu')):
     model = model.eval()
@@ -80,7 +82,8 @@ def get_image_pairs_shortlist(fnames,
 
     if num_imgs <= exhaustive_if_less:
         return get_img_pairs_exhaustive(fnames)
-    model = torch.load('/root/code/3Dreconstruction/model/swinv2_base_patch4_window12_192_22k.pth')
+    model = torch.load(
+        '/root/code/3Dreconstruction/model/swinv2_base_patch4_window12_192_22k.pth')
     model = timm.create_model('tf_efficientnet_b7',
                               checkpoint_path='/root/code/3Dreconstruction/model/tf_efficientnet_b7_ra-6c08e654.pth')
     # model = timm.create_model('tf_efficientnet_b7',
@@ -487,14 +490,14 @@ def get_image_pairs_shortlist(fnames,
 #                 f_desc[key] = descs
 #     return
 
-def get_unique_idxs(A, dim=0):
-    # https://stackoverflow.com/questions/72001505/how-to-get-unique-elements-and-their-firstly-appeared-indices-of-a-pytorch-tenso
-    unique, idx, counts = torch.unique(A, dim=dim, sorted=True, return_inverse=True, return_counts=True)
-    _, ind_sorted = torch.sort(idx, stable=True)
-    cum_sum = counts.cumsum(0)
-    cum_sum = torch.cat((torch.tensor([0],device=cum_sum.device), cum_sum[:-1]))
-    first_indices = ind_sorted[cum_sum]
-    return first_indices
+# def get_unique_idxs(A, dim=0):
+#     # https://stackoverflow.com/questions/72001505/how-to-get-unique-elements-and-their-firstly-appeared-indices-of-a-pytorch-tenso
+#     unique, idx, counts = torch.unique(A, dim=dim, sorted=True, return_inverse=True, return_counts=True)
+#     _, ind_sorted = torch.sort(idx, stable=True)
+#     cum_sum = counts.cumsum(0)
+#     cum_sum = torch.cat((torch.tensor([0],device=cum_sum.device), cum_sum[:-1]))
+#     first_indices = ind_sorted[cum_sum]
+#     return first_indices
 
 # def match_features(img_fnames,
 #                    index_pairs,
@@ -548,23 +551,112 @@ def get_unique_idxs(A, dim=0):
 #                          group.create_dataset(key2, data=idxs.detach().cpu().numpy().reshape(-1, 2))
 #     return
 
+
+def resize_img_loftr(img, max_len, enlarge_scale, variant_scale, device):
+    if max_len == -1:
+        scale = 1
+    else:
+        scale = max(max_len, max(img.shape[0], img.shape[1]) * enlarge_scale) / max(img.shape[0], img.shape[1])
+    w = int(round(img.shape[1] * scale) / 8) * 8
+    h = int(round(img.shape[0] * scale) / 8) * 8
+    
+    isResized = False
+    if w >= h:
+        if int(h * variant_scale) <= w:
+            isResized = True
+            h = int(h * variant_scale / 8) * 8
+    else:
+        if int(w * variant_scale) <= h:
+            isResized = True
+            w = int(w * variant_scale / 8) * 8
+    img_resize = cv2.resize(img, (w, h)) 
+    img_resize = K.image_to_tensor(img_resize, False).float() / 255.
+    
+    return img_resize.to(device), (w / img.shape[1], h / img.shape[0]), isResized
+
+
+def matcher(img_fnames,
+            index_pairs,
+            feature_dir='.featureout_loftr',
+            device=torch.device('cpu'),
+            min_matches=15, resize_to_=(640, 480)):
+    
+    scales_lens_loftr = [[1.1, 1000, 1.0], [1, 1200, 1.3], [0.9, 1400, 1.6]]
+    scales_lens_superglue = [[1.2, 1200, 1.0], [1.2, 1600, 1.6], [0.8, 2000, 2], [1, 2800, 3]]
+    w_h_muts_dkm = [[680 * 510, 1]]
+
+    matcher_loftr = KF.LoFTR(pretrained=None)
+    matcher_loftr.load_state_dict(torch.load(
+        '/root/code/3Dreconstruction/kornia-loftr/loftr_outdoor.ckpt')['state_dict'])
+    matcher_loftr = matcher_loftr.to(device).eval()
+
+    for pair_idx in progress_bar(index_pairs):
+        idx1, idx2 = pair_idx
+        fname1, fname2 = img_fnames[idx1], img_fnames[idx2]
+        key1, key2 = fname1.split('/')[-1], fname2.split('/')[-1]
+        image_0_BGR = cv2.imread(fname1)
+        image_1_BGR = cv2.imread(fname2)
+        
+        image_0_GRAY = cv2.cvtColor(image_0_BGR, cv2.COLOR_BGR2GRAY)
+        image_1_GRAY = cv2.cvtColor(image_1_BGR, cv2.COLOR_BGR2GRAY)
+        
+        # ----- LoFTR -----        
+        mkpts0_loftr_all = []
+        mkpts1_loftr_all = []
+        for variant_scale, max_len, enlarge_scale in scales_lens_loftr:
+            
+            image_0_resize, scale_0, isResized_0 = resize_img_loftr(image_0_GRAY, max_len, enlarge_scale, variant_scale, device)
+            image_1_resize, scale_1, isResized_1 = resize_img_loftr(image_1_GRAY, max_len, enlarge_scale, variant_scale, device)
+            
+            if isResized_0 == False or isResized_1 == False: continue
+            
+            input_dict = {"image0": image_0_resize, 
+                      "image1": image_1_resize}
+            correspondences = matcher_loftr(input_dict)
+            confidence = correspondences['confidence'].cpu().numpy()
+            
+            if len(confidence) < 1: continue
+
+            confidence_quantile = np.quantile(confidence, 0.6)
+            idx = np.where(confidence >= confidence_quantile)
+            
+            mkpts0_loftr = correspondences['keypoints0'].cpu().numpy()[idx]
+            mkpts1_loftr = correspondences['keypoints1'].cpu().numpy()[idx]
+            
+            print("loftr scale_0", scale_0)
+            print("loftr scale_1", scale_1)
+
+            mkpts0_loftr = mkpts0_loftr / scale_0
+            mkpts1_loftr = mkpts1_loftr / scale_1
+
+            mkpts0_loftr_all.append(mkpts0_loftr)
+            mkpts1_loftr_all.append(mkpts1_loftr)
+        
+        mkpts0_loftr_all = np.concatenate(mkpts0_loftr_all, axis=0)
+        mkpts1_loftr_all = np.concatenate(mkpts1_loftr_all, axis=0) 
+        
+    return
+
+
 def match_loftr(img_fnames,
-                   index_pairs,
-                   feature_dir = '.featureout_loftr',
-                   device=torch.device('cpu'),
-                   min_matches=15, resize_to_ = (640, 480)):
+                index_pairs,
+                feature_dir='.featureout_loftr',
+                device=torch.device('cpu'),
+                min_matches=15, resize_to_=(640, 480)):
     matcher = KF.LoFTR(pretrained=None)
-    matcher.load_state_dict(torch.load('/root/code/3Dreconstruction/kornia-loftr/loftr_outdoor.ckpt')['state_dict'])
+    matcher.load_state_dict(torch.load(
+        '/root/code/3Dreconstruction/kornia-loftr/loftr_outdoor.ckpt')['state_dict'])
     matcher = matcher.to(device).eval()
 
-    # First we do pairwise matching, and then extract "keypoints" from loftr matches
+    # First we do pairwise matching, and then extract "keypoints" from loftr matches.
     with h5py.File(f'{feature_dir}/matches_loftr.h5', mode='w') as f_match:
         for pair_idx in progress_bar(index_pairs):
             idx1, idx2 = pair_idx
             fname1, fname2 = img_fnames[idx1], img_fnames[idx2]
             key1, key2 = fname1.split('/')[-1], fname2.split('/')[-1]
             # Load img1
-            timg1 = K.color.rgb_to_grayscale(load_torch_image(fname1, device=device))
+            timg1 = K.color.rgb_to_grayscale(
+                load_torch_image(fname1, device=device))
             H1, W1 = timg1.shape[2:]
             if H1 < W1:
                 resize_to = resize_to_[1], resize_to_[0]
@@ -574,86 +666,91 @@ def match_loftr(img_fnames,
             h1, w1 = timg_resized1.shape[2:]
 
             # Load img2
-            timg2 = K.color.rgb_to_grayscale(load_torch_image(fname2, device=device))
+            timg2 = K.color.rgb_to_grayscale(
+                load_torch_image(fname2, device=device))
             H2, W2 = timg2.shape[2:]
             if H2 < W2:
                 resize_to2 = resize_to[1], resize_to[0]
             else:
                 resize_to2 = resize_to_
-            timg_resized2 = K.geometry.resize(timg2, resize_to2, antialias=True)
+            timg_resized2 = K.geometry.resize(
+                timg2, resize_to2, antialias=True)
             h2, w2 = timg_resized2.shape[2:]
             with torch.inference_mode():
-                input_dict = {"image0": timg_resized1,"image1": timg_resized2}
+                input_dict = {"image0": timg_resized1, "image1": timg_resized2}
                 correspondences = matcher(input_dict)
-            mkpts0_loftr = correspondences['keypoints0'].cpu().numpy()
-            mkpts1_loftr = correspondences['keypoints1'].cpu().numpy()
+            mkpts0 = correspondences['keypoints0'].cpu().numpy()
+            mkpts1 = correspondences['keypoints1'].cpu().numpy()
 
-            mkpts0_loftr[:,0] *= float(W1) / float(w1)
-            mkpts0_loftr[:,1] *= float(H1) / float(h1)
+            mkpts0[:, 0] *= float(W1) / float(w1)
+            mkpts0[:, 1] *= float(H1) / float(h1)
 
-            mkpts1_loftr[:,0] *= float(W2) / float(w2)
-            mkpts1_loftr[:,1] *= float(H2) / float(h2)
+            mkpts1[:, 0] *= float(W2) / float(w2)
+            mkpts1[:, 1] *= float(H2) / float(h2)
 
-            n_matches = len(mkpts1_loftr)
-            group  = f_match.require_group(key1)
+            n_matches = len(mkpts1)
+            group = f_match.require_group(key1)
             if n_matches >= min_matches:
-                 group.create_dataset(key2, data=np.concatenate([mkpts0_loftr, mkpts1_loftr], axis=1))
-                 
-    return 
+                group.create_dataset(
+                    key2, data=np.concatenate([mkpts0, mkpts1], axis=1))
+
     # Let's find unique loftr pixels and group them together.
-    # kpts = defaultdict(list)
-    # match_indexes = defaultdict(dict)
-    # total_kpts=defaultdict(int)
-    # with h5py.File(f'{feature_dir}/matches_loftr.h5', mode='r') as f_match:
-    #     for k1 in f_match.keys():
-    #         group  = f_match[k1]
-    #         for k2 in group.keys():
-    #             matches = group[k2][...]
-    #             total_kpts[k1]
-    #             kpts[k1].append(matches[:, :2])
-    #             kpts[k2].append(matches[:, 2:])
-    #             current_match = torch.arange(len(matches)).reshape(-1, 1).repeat(1, 2)
-    #             current_match[:, 0]+=total_kpts[k1]
-    #             current_match[:, 1]+=total_kpts[k2]
-    #             total_kpts[k1]+=len(matches)
-    #             total_kpts[k2]+=len(matches)
-    #             match_indexes[k1][k2]=current_match
+    kpts = defaultdict(list)
+    match_indexes = defaultdict(dict)
+    total_kpts = defaultdict(int)
+    with h5py.File(f'{feature_dir}/matches_loftr.h5', mode='r') as f_match:
+        for k1 in f_match.keys():
+            group = f_match[k1]
+            for k2 in group.keys():
+                matches = group[k2][...]
+                total_kpts[k1]
+                kpts[k1].append(matches[:, :2])
+                kpts[k2].append(matches[:, 2:])
+                current_match = torch.arange(
+                    len(matches)).reshape(-1, 1).repeat(1, 2)
+                current_match[:, 0] += total_kpts[k1]
+                current_match[:, 1] += total_kpts[k2]
+                total_kpts[k1] += len(matches)
+                total_kpts[k2] += len(matches)
+                match_indexes[k1][k2] = current_match
 
-    # for k in kpts.keys():
-    #     kpts[k] = np.round(np.concatenate(kpts[k], axis=0))
-    # unique_kpts = {}
-    # unique_match_idxs = {}
-    # out_match = defaultdict(dict)
-    # for k in kpts.keys():
-    #     uniq_kps, uniq_reverse_idxs = torch.unique(torch.from_numpy(kpts[k]),dim=0, return_inverse=True)
-    #     unique_match_idxs[k] = uniq_reverse_idxs
-    #     unique_kpts[k] = uniq_kps.numpy()
-    # for k1, group in match_indexes.items():
-    #     for k2, m in group.items():
-    #         m2 = deepcopy(m)
-    #         m2[:,0] = unique_match_idxs[k1][m2[:,0]]
-    #         m2[:,1] = unique_match_idxs[k2][m2[:,1]]
-    #         mkpts = np.concatenate([unique_kpts[k1][ m2[:,0]],
-    #                                 unique_kpts[k2][  m2[:,1]],
-    #                                ],
-    #                                axis=1)
-    #         unique_idxs_current = get_unique_idxs(torch.from_numpy(mkpts), dim=0)
-    #         m2_semiclean = m2[unique_idxs_current]
-    #         unique_idxs_current1 = get_unique_idxs(m2_semiclean[:, 0], dim=0)
-    #         m2_semiclean = m2_semiclean[unique_idxs_current1]
-    #         unique_idxs_current2 = get_unique_idxs(m2_semiclean[:, 1], dim=0)
-    #         m2_semiclean2 = m2_semiclean[unique_idxs_current2]
-    #         out_match[k1][k2] = m2_semiclean2.numpy()
-    # with h5py.File(f'{feature_dir}/keypoints.h5', mode='w') as f_kp:
-    #     for k, kpts1 in unique_kpts.items():
-    #         f_kp[k] = kpts1
+    for k in kpts.keys():
+        kpts[k] = np.round(np.concatenate(kpts[k], axis=0))
+    unique_kpts = {}
+    unique_match_idxs = {}
+    out_match = defaultdict(dict)
+    for k in kpts.keys():
+        uniq_kps, uniq_reverse_idxs = torch.unique(
+            torch.from_numpy(kpts[k]), dim=0, return_inverse=True)
+        unique_match_idxs[k] = uniq_reverse_idxs
+        unique_kpts[k] = uniq_kps.numpy()
+    for k1, group in match_indexes.items():
+        for k2, m in group.items():
+            m2 = deepcopy(m)
+            m2[:, 0] = unique_match_idxs[k1][m2[:, 0]]
+            m2[:, 1] = unique_match_idxs[k2][m2[:, 1]]
+            mkpts = np.concatenate([unique_kpts[k1][m2[:, 0]],
+                                    unique_kpts[k2][m2[:, 1]],
+                                    ],
+                                   axis=1)
+            unique_idxs_current = get_unique_idxs(
+                torch.from_numpy(mkpts), dim=0)
+            m2_semiclean = m2[unique_idxs_current]
+            unique_idxs_current1 = get_unique_idxs(m2_semiclean[:, 0], dim=0)
+            m2_semiclean = m2_semiclean[unique_idxs_current1]
+            unique_idxs_current2 = get_unique_idxs(m2_semiclean[:, 1], dim=0)
+            m2_semiclean2 = m2_semiclean[unique_idxs_current2]
+            out_match[k1][k2] = m2_semiclean2.numpy()
+    with h5py.File(f'{feature_dir}/keypoints.h5', mode='w') as f_kp:
+        for k, kpts1 in unique_kpts.items():
+            f_kp[k] = kpts1
 
-    # with h5py.File(f'{feature_dir}/matches.h5', mode='w') as f_match:
-    #     for k1, gr in out_match.items():
-    #         group  = f_match.require_group(k1)
-    #         for k2, match in gr.items():
-    #             group[k2] = match
-    # return
+    with h5py.File(f'{feature_dir}/matches.h5', mode='w') as f_match:
+        for k1, gr in out_match.items():
+            group = f_match.require_group(k1)
+            for k2, match in gr.items():
+                group[k2] = match
+    return
 
 # def import_into_colmap(img_dir,
 #                        feature_dir ='.featureout',
@@ -672,6 +769,7 @@ def match_loftr(img_fnames,
 #     db.commit()
 #     return
 
+
 src = '/root/code/3Dreconstruction/kaggle/input/image-matching-challenge-2023'
 # Get train data
 data_dict = {}
@@ -687,7 +785,7 @@ with open(f'{src}/train/train_labels.csv', 'r') as f:
                 data_dict[dataset][scene] = []
             data_dict[dataset][scene].append(image)
 
-# Get test data 
+# Get data from csv.
 
 # data_dict = {}
 # with open(f'{src}/sample_submission.csv', 'r') as f:
@@ -754,15 +852,14 @@ for dataset in datasets:
         # Fail gently if the notebook has not been submitted and the test data is not populated.
         # You may want to run this on the training data in that case?
         img_dir = f'{src}/train/{dataset}/{scene}/images'
-        # img_dir = f'{src}/test/{dataset}/{scene}/images'
-
         if not os.path.exists(img_dir):
             continue
         # Wrap the meaty part in a try-except block.
         try:
             out_results[dataset][scene] = {}
             # -----train-----
-            img_fnames = [f'{src}/train/{x}' for x in data_dict[dataset][scene]]
+            img_fnames = [
+                f'{src}/train/{x}' for x in data_dict[dataset][scene]]
             # -----test-----
             # img_fnames = [f'{src}/test/{x}' for x in data_dict[dataset][scene]]
             print(f"Got {len(img_fnames)} images")
@@ -775,11 +872,11 @@ for dataset in datasets:
                                                     min_pairs=20,  # we select at least min_pairs PER IMAGE with biggest similarity
                                                     exhaustive_if_less=20,
                                                     device=device)
-            t=time() -t
+            t = time() - t
             timings['shortlisting'].append(t)
-            print (f'{len(index_pairs)}, pairs to match, {t:.4f} sec')
+            print(f'{len(index_pairs)}, pairs to match, {t:.4f} sec')
             gc.collect()
-            t=time()
+            t = time()
             # if LOCAL_FEATURE != 'LoFTR':
             #     detect_features(img_fnames,
             #                     2048,
@@ -795,7 +892,8 @@ for dataset in datasets:
             #     t=time()
             #     match_features(img_fnames, index_pairs, feature_dir=feature_dir,device=device)
             # else:
-            match_loftr(img_fnames, index_pairs, feature_dir=feature_dir, device=device, resize_to_=(600, 800))
+            matcher(img_fnames, index_pairs, feature_dir=feature_dir,
+                        device=device, resize_to_=(600, 800))
             # t=time() -t
             # timings['feature_matching'].append(t)
             # print(f'Features matched in  {t:.4f} sec')
